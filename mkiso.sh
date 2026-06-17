@@ -1,5 +1,9 @@
 #!/bin/bash
 
+ARCH=$(xbps-uhelper arch)
+
+set -euo pipefail
+
 [[ $# -gt 0 ]] || {
 	echo "Usage: $0 <mode> [options]"
 	exit 1
@@ -17,6 +21,8 @@ shift
 prepare_chroot() {
 	root="$1"
 
+	mkdir -p $root/{dev,proc,sys,tmp}
+
 	mount --rbind /dev "$root/dev"
 	mount --make-rslave "$root/dev"
 
@@ -27,6 +33,10 @@ prepare_chroot() {
 	mount --make-rslave "$root/sys"
 	
 	mount -t tmpfs tmpfs "$root/tmp"
+
+	ln -sf usr/bin "$root/bin"
+	ln -sf usr/sbin "$root/sbin"
+	ln -sf usr/lib "$root/lib"
 }
 
 cleanup_chroot() {
@@ -42,10 +52,27 @@ run_chroot() {
 	root="$1"
 	shift
 
-	chroot "$root" /bin/bash
+	chroot "$root" /bin/bash -s
 }
 
 case "$mode" in
+	clean)
+		[[ $# -eq 0 ]] || {
+			echo "!!! clean does not accept any arguments"
+			exit 1
+		}
+
+		echo ">>> Cleaning"
+
+		rm -rf work
+		rm -rf output
+
+		echo "" > repos.conf
+
+		echo "Done cleaning"
+
+		;;
+
 	install-tools)
 		repo="https://repo-de.voidlinux.org/current/musl"
 
@@ -66,6 +93,7 @@ case "$mode" in
 		echo ">>> Installing tool"
 
 		sudo xbps-install \
+			-S \
 			-R $repo \
 			xbps \
 			xorriso \
@@ -81,15 +109,14 @@ case "$mode" in
 	
 	build)
 		flavour=""
-		repo="https://repo-de.voidlinux.org/current/musl"
+		custom_repo=""
 		flag_x=false
 		flag_c=false
 
-		while getopts ":f:r:xc" opt; do
+		while getopts ":f:xc" opt; do
 			case "$opt" in
 					f) flavour="$OPTARG" ;;
 					x) flag_x=true ;;
-					r) repo="$OPTARG" ;;
 					c) flag_c=true ;;
 					:)
 						echo "!!! -$OPTARG requires an argument"
@@ -102,9 +129,23 @@ case "$mode" in
 			esac
 		done
 
+		repos=()
+
+		while read -r repo; do
+			[[ -z "$repo" ]] && continue
+
+			if [[ "$repo" == /* ]]; then
+				[[ -d "$repo" ]] || continue
+			fi
+
+			repos+=("-R" "$repo")
+		done < repos.conf
+
 		echo ">>> Preparing build"
 		
 		rm -rf work
+		rm -rf output
+
 		mkdir work
 		
 		echo "Done preparing build"
@@ -113,9 +154,9 @@ case "$mode" in
 
 		mkdir work/rootfs
 
-		xbps-install \
-			-Sy \
-			-R $repo \
+		sudo XBPS_ARCH=x86_64-musl xbps-install \
+			-S \
+			"${repos[@]}" \
 			-r work/rootfs \
 			$(cat profiles/$flavour/packages)
 
@@ -125,7 +166,7 @@ case "$mode" in
 
 		mkdir -p work/rootfs/etc/xbps.d
 
-		echo "$repo" > work/rootfs/etc/xbps.d/main-repo.conf
+		cp repos.conf work/rootfs/etc/xbps.d/main-repo.conf
 
 		echo "Done updating repositories"
 
@@ -135,26 +176,52 @@ case "$mode" in
 
 		trap 'cleanup_chroot work/rootfs' EXIT
 
-		run_chroot work/rootfs <<EOF
+		run_chroot work/rootfs <<-'EOF'
 
-		echo "root:snareslinux" | chpasswd
+xbps-reconfigure -fa
 
-		useradd -m anon
-		echo "anon:snareslinux" | chpasswd
-		
-		echo "snares" > /etc/hostname
+HASH=$(openssl passwd -6 "snareslinux")
+usermod -p "$HASH" root
 
-		mkdir -p /etc/dinit.d/boot.d
+useradd -m anon
+usermod -p "$HASH" anon
 
-		ln -sf /etc/dinit.d/dbus /etc/dinit.d/boot.d/dbus
-		ln -sf /etc/dinit.d/NetworkManager /etc/dinit.d/boot.d/NetworkManager
+useradd -f wheel
+usermod -aG wheel anon
 
-		rm -rf /sbin/init
-		ln -sf /sbin/dinit /sbin/init
+mkdir -p /etc/sudoers.d
+echo "%wheel ALL=(ALL) ALL" > /etc/sudoers.d/wheel
+chmod 0440 /etc/sudoers.d/wheel
 
-		xbps-reconfigure -fa
+echo "snares" > /etc/hostname
+dbus-uuidgen --ensure
 
-		EOF
+echo "snares" > /etc/hostname
+dbus-uuidgen --ensure
+
+mkdir -p /var/log/dinit
+
+rm -rf /sbin/init
+ln -sf /sbin/dinit /sbin/init
+
+mkdir -p /etc/dracut.conf.d
+
+cat > /etc/dracut.conf.d/live.conf <<DRACUT
+add_dracutmodules+=" dmsquash-live pollcdrom "
+hostonly="no"
+DRACUT
+
+dracut -f /boot/initramfs-live.img $(ls /lib/modules)
+
+for kernel in /lib/modules/*; do
+	kver=$(basename "$kernel")
+	dracut -f \
+		--add "dmsquash-live pollcdrom" \
+		/boot/initramfs.img \
+		"$kver"
+done
+
+EOF
 
 		echo "Done configuring"
 
@@ -174,7 +241,7 @@ case "$mode" in
 		mkdir -p work/iso/live
 
 		cp work/rootfs/boot/vmlinuz* work/iso/boot/vmlinuz
-		cp work/rootfs/boot/initramfs* work/iso/boot/initramfs.img
+		cp work/rootfs/boot/initramfs.img work/iso/boot/initramfs.img
 
 		echo "Done preparing"
 
@@ -200,6 +267,7 @@ case "$mode" in
 		mkdir output
 
 		grub-mkrescue \
+			-volid SNARES \
 			-o output/snares.iso \
 			work/iso
 		
